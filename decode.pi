@@ -1,0 +1,268 @@
+// Decoding one complete item, checked against the options. Every error names what's wrong; none
+// panics, whatever the bytes (fuzz.test.pi).
+import { hex } from "std/encoding"
+import { Cbor, CborEntry, CborError, CborOptions, nested, tagged } from "./cbor"
+
+/// Strict UTF-8 for text items.
+const UTF8 = TextDecoder.utf8({ fatal: true })
+
+class Reader {
+  bytes: Uint8Array
+  view: DataView
+  options: CborOptions
+  pos: int = 0
+
+  constructor(bytes: Uint8Array, options: CborOptions) {
+    this.bytes = bytes
+    this.view = new DataView(bytes)
+    this.options = options
+  }
+
+  public get done(): bool {
+    return pos == bytes.length
+  }
+
+  /// Moves past `n` bytes, which must be there; the position before them.
+  need(n: int): int throws CborError {
+    if (n < 0 || pos + n > bytes.length) {
+      throw new CborError("truncated")
+    }
+    const at = pos
+    pos += n
+    return at
+  }
+
+  argument(info: int): u64 throws CborError {
+    if (info < 24) {
+      return info as u64
+    }
+    match (info) {
+      24 => view.getUint8(need(1)) as u64,
+      25 => view.getUint16(need(2)) as u64,
+      26 => view.getUint32(need(4)) as u64,
+      27 => view.getBigUint64(need(8)),
+      31 => throw new CborError("indefinite lengths are not allowed"),
+      _ => throw new CborError(`reserved additional information ${info}`),
+    }
+  }
+
+  /// A length that has to fit in what's left of the message.
+  length(info: int, minItemBytes: int): int throws CborError {
+    const n = argument(info)
+    const left = ((bytes.length - pos) / minItemBytes) as u64
+    if (n > left) {
+      throw new CborError("a length beyond the end of the message")
+    }
+    return n as int
+  }
+
+  /// Whether an indefinite-length item starts here (info 31), if the options allow one.
+  indefinite(info: int): bool throws CborError {
+    if (info != 31) {
+      return false
+    }
+    if (options.indefinite == false) {
+      throw new CborError("indefinite lengths are not allowed")
+    }
+    return true
+  }
+
+  /// Whether the next byte is a break (and moves past it).
+  isBreak(): bool throws CborError {
+    if (pos >= bytes.length) {
+      throw new CborError("truncated")
+    }
+    if (bytes.get(pos) == 0xff) {
+      pos += 1
+      return true
+    }
+    return false
+  }
+
+  public item(depth: int): Cbor throws CborError {
+    const initial = bytes.get(need(1))
+    const info = initial & 0x1f
+    match (initial >> 5) {
+      0 => Cbor.Uint(argument(info)),
+      1 => Cbor.Negative(argument(info)),
+      2 => Cbor.Bytes(byteString(info)),
+      3 => Cbor.Text(textString(info)),
+      4 => list(info, depth),
+      5 => map(info, depth),
+      6 => tag(info, depth),
+      _ => simple(info),
+    }
+  }
+
+  /// The bytes of a definite byte or text string.
+  chunk(info: int): Uint8Array throws CborError {
+    const n = length(info, 1)
+    const start = need(n)
+    return bytes.subarray(start, start + n)
+  }
+
+  /// A byte or text string's bytes: one definite chunk, or definite chunks of `major` up to a break.
+  stringBytes(info: int, major: int): Uint8Array throws CborError {
+    if (!indefinite(info)) {
+      return chunk(info)
+    }
+    const parts: Uint8Array[] = []
+    let total = 0
+    while (!isBreak()) {
+      const initial = bytes.get(need(1))
+      if ((initial >> 5) != major || (initial & 0x1f) == 31) {
+        throw new CborError("an indefinite-length string holds a chunk of another kind")
+      }
+      const part = chunk(initial & 0x1f)
+      parts.push(part)
+      total += part.length
+    }
+    const out = new Uint8Array(total)
+    let at = 0
+    for (const part of parts) {
+      out.setAll(part, at)
+      at += part.length
+    }
+    return out
+  }
+
+  byteString(info: int): Uint8Array throws CborError {
+    stringBytes(info, 2).slice()
+  }
+
+  textString(info: int): string throws CborError {
+    const b = stringBytes(info, 3)
+    try {
+      UTF8.decode(b)
+    } catch (e: TypeError) {
+      throw new CborError("text is not valid UTF-8")
+    }
+  }
+
+  list(info: int, depth: int): Cbor throws CborError {
+    nested(depth, options)
+    const items: Cbor[] = []
+    if (indefinite(info)) {
+      while (!isBreak()) {
+        items.push(item(depth + 1))
+      }
+    } else {
+      const n = length(info, 1)
+      for (let i = 0; i < n; i++) {
+        items.push(item(depth + 1))
+      }
+    }
+    Cbor.List(items)
+  }
+
+  map(info: int, depth: int): Cbor throws CborError {
+    nested(depth, options)
+    const entries: CborEntry[] = []
+    const seen = new Set<string>()
+    let texts = 0
+    let uints = 0
+    const open = indefinite(info)
+    const n = if (open) 0 else length(info, 2)
+    let i = 0
+    while (if (open) !isBreak() else i < n) {
+      const start = pos
+      const key = item(depth + 1)
+      const id = match (key) {
+        Text { value } => {
+          texts += 1
+          `t${value}`
+        },
+        Uint { value } => {
+          uints += 1
+          `u${value}`
+        },
+        _ => {
+          if (options.anyKeys == false) {
+            throw new CborError("map keys must be text or unsigned integers")
+          }
+          `x${hex.encode(bytes.subarray(start, pos))}`
+        },
+      }
+      if (seen.has(id)) {
+        throw new CborError("duplicate map key")
+      }
+      seen.add(id)
+      entries.push({ key, value: item(depth + 1) })
+      i += 1
+    }
+    const count = entries.length
+    if (texts == count) {
+      const m = new Map<string, Cbor>()
+      for (const e of entries) {
+        match (e.key) {
+          Text { value } => {
+            m.set(value, e.value);
+          },
+          _ => {},
+        }
+      }
+      return Cbor.Dict(m)
+    }
+    if (uints == count) {
+      const m = new Map<u64, Cbor>()
+      for (const e of entries) {
+        match (e.key) {
+          Uint { value } => {
+            m.set(value, e.value);
+          },
+          _ => {},
+        }
+      }
+      return Cbor.Keyed(m)
+    }
+    if (options.anyKeys == false) {
+      throw new CborError("a map mixes text and integer keys")
+    }
+    Cbor.Pairs(entries)
+  }
+
+  tag(info: int, depth: int): Cbor throws CborError {
+    if (options.tags == false) {
+      throw new CborError("tags are not allowed")
+    }
+    nested(depth, options)
+    const number = argument(info)
+    tagged(number, item(depth + 1))
+  }
+
+  simple(info: int): Cbor throws CborError {
+    const any = options.simple != false
+    match (info) {
+      20 => Cbor.Bool(false),
+      21 => Cbor.Bool(true),
+      22 => Cbor.Null,
+      23 => if (any) Cbor.Undefined else throw new CborError("undefined is not allowed"),
+      24 => {
+        const v = bytes.get(need(1))
+        if (!any) {
+          throw new CborError("simple values other than false, true and null are not allowed")
+        }
+        if (v < 32) {
+          throw new CborError(`simple(${v}) must be encoded in one byte`)
+        }
+        Cbor.Simple(v)
+      },
+      25 => Cbor.Float(view.getFloat16(need(2))),
+      26 => Cbor.Float(view.getFloat32(need(4)) as f64),
+      27 => Cbor.Float(view.getFloat64(need(8))),
+      31 => throw new CborError("unexpected break"),
+      28 | 29 | 30 => throw new CborError(`reserved additional information ${info}`),
+      _ => if (any) Cbor.Simple(info) else throw new CborError("simple values other than false, true and null are not allowed"),
+    }
+  }
+}
+
+/// Decodes one complete item (trailing bytes are an error).
+export function decode(bytes: Uint8Array, options: CborOptions = {}): Cbor throws CborError {
+  const r = new Reader(bytes, options)
+  const v = r.item(1)
+  if (!r.done) {
+    throw new CborError("trailing bytes after the item")
+  }
+  return v
+}

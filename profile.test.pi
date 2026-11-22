@@ -1,0 +1,94 @@
+// The Pico Desktop profile against that project's shared vectors (vectors/pico-desktop.json, from
+// packages/protocol/vectors/cbor.json): byte-exact encoding, decoded values compared through
+// `diagnostic` with float bits, and everything outside the profile rejected.
+import { describe, it, expect } from "std/test"
+import { readText } from "std/fs"
+import { hex } from "std/encoding"
+import { Cbor, CborError, PICO_DESKTOP, decode, diagnostic, encode, integer, tagged } from "./index"
+
+struct Decodable {
+  name: string
+  hex: string
+  diag: string
+}
+
+struct Rejected {
+  name: string
+  hex: string
+}
+
+struct CborVectors {
+  roundtrip: Decodable[]
+  decode: Decodable[]
+  invalid: Rejected[]
+}
+
+const vectors = JSON.parse<CborVectors>(await readText("vectors/pico-desktop.json"))
+
+function diag(v: Cbor): string {
+  diagnostic(v, { floatBits: true })
+}
+
+function rejects(bytes: Uint8Array): bool {
+  try {
+    decode(bytes, PICO_DESKTOP)
+    false
+  } catch (e: CborError) {
+    true
+  }
+}
+
+describe("the Pico Desktop vectors", () => {
+  for (const v of vectors.roundtrip) {
+    it(`encodes ${v.name}`, () => {
+      expect(hex.encode(encode(decode(hex.decode(v.hex), PICO_DESKTOP), PICO_DESKTOP))).toBe(v.hex)
+    })
+    it(`decodes ${v.name}`, () => {
+      expect(diag(decode(hex.decode(v.hex), PICO_DESKTOP))).toBe(v.diag)
+    })
+  }
+  for (const v of vectors.decode) {
+    it(`accepts ${v.name}`, () => {
+      expect(diag(decode(hex.decode(v.hex), PICO_DESKTOP))).toBe(v.diag)
+    })
+  }
+  for (const v of vectors.invalid) {
+    it(`rejects ${v.name}`, () => {
+      expect(rejects(hex.decode(v.hex))).toBe(true)
+    })
+  }
+})
+
+function nestingRefused(depth: int): bool {
+  let deep = integer(0)
+  for (let i = 0; i < depth; i++) {
+    deep = Cbor.List([deep])
+  }
+  try {
+    encode(deep, PICO_DESKTOP)
+    false
+  } catch (e: CborError) {
+    true
+  }
+}
+
+describe("the profile", () => {
+  it("writes every float as a double", () => {
+    expect(hex.encode(encode(Cbor.Float(1.5), PICO_DESKTOP))).toBe("fb3ff8000000000000")
+  })
+  it("limits nesting to 32 levels", () => {
+    expect(nestingRefused(32)).toBe(false)
+    expect(nestingRefused(33)).toBe(true)
+  })
+  it("refuses to encode what it can't decode", () => {
+    let refused = 0
+    for (const v of [tagged(1, integer(0)), Cbor.Undefined, Cbor.Simple(16), Cbor.Pairs([{ key: integer(-1), value: Cbor.Null }])]) {
+      try {
+        encode(v, PICO_DESKTOP);
+      } catch (e: CborError) {
+        refused += 1
+      }
+    }
+    expect(refused).toBe(4)
+  })
+})

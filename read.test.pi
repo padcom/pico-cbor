@@ -1,0 +1,39 @@
+// The typed readers: values out of `Cbor` items, failures naming the path.
+import { describe, it, expect } from "std/test"
+import { Cbor, InvalidPayload, choice, float, int, integer, items, members, required, tagOf, text, uint } from "./index"
+
+function failure(f: () => void throws InvalidPayload): string {
+  try {
+    f()
+    ""
+  } catch (e: InvalidPayload) {
+    e.message
+  }
+}
+
+describe("reading typed values", () => {
+  const fields = new Map<string, Cbor>()
+  fields.set("name", Cbor.Text("ada"))
+  fields.set("age", integer(36))
+  fields.set("kind", Cbor.Text("user"))
+  fields.set("tags", Cbor.List([Cbor.Text("a")]))
+  fields.set("ratio", integer(-2))
+  const v = Cbor.Dict(fields)
+  it("reads members", () => {
+    const m = members(v, "$", ["name", "age", "kind", "tags", "ratio"])
+    expect(text(required(m, "name", "$"), "$.name")).toBe("ada")
+    expect(uint(required(m, "age", "$"), "$.age", 255)).toBe(36)
+    expect(choice(required(m, "kind", "$"), "$.kind", ["user", "admin"])).toBe("user")
+    expect(items(required(m, "tags", "$"), "$.tags").length).toBe(1)
+    expect(int(required(m, "ratio", "$"), "$.ratio")).toBe(-2)
+    expect(float(required(m, "ratio", "$"), "$.ratio")).toBe(-2.0)
+    expect(tagOf(v, "$", "kind")).toBe("user")
+  })
+  it("names the path of what doesn't fit", () => {
+    expect(failure(() => { members(v, "$", ["name"]); })).toBe("$.age: expected no such member")
+    expect(failure(() => { required(new Map<string, Cbor>(), "id", "$.user"); })).toBe("$.user.id: expected present")
+    expect(failure(() => { uint(Cbor.Uint(300), "$.n", 255); })).toBe("$.n: expected an unsigned integer up to 255")
+    expect(failure(() => { choice(Cbor.Text("x"), "$.k", ["a", "b"]); })).toBe("$.k: expected a or b")
+    expect(failure(() => { text(Cbor.Null, "$.t"); })).toBe("$.t: expected text")
+  })
+})

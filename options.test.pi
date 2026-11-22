@@ -1,0 +1,83 @@
+// What the options switch on and off, and the parts of the data model the vectors don't reach.
+import { describe, it, expect } from "std/test"
+import { hex } from "std/encoding"
+import { Cbor, CborError, CborOptions, decode, diagnostic, encode, integer, tagged } from "./index"
+
+function error(h: string, options: CborOptions = {}): string {
+  try {
+    decode(hex.decode(h), options)
+    ""
+  } catch (e: CborError) {
+    e.message
+  }
+}
+
+describe("decoding options", () => {
+  it("can refuse tags, indefinite lengths and simple values", () => {
+    expect(error("c11a514b67b0", { tags: false })).toBe("tags are not allowed")
+    expect(error("9fff", { indefinite: false })).toBe("indefinite lengths are not allowed")
+    expect(error("5f42010243030405ff", { indefinite: false })).toBe("indefinite lengths are not allowed")
+    expect(error("f7", { simple: false })).toBe("undefined is not allowed")
+    expect(error("f0", { simple: false })).toBe("simple values other than false, true and null are not allowed")
+    expect(error("f5", { simple: false })).toBe("")
+  })
+  it("limits nesting", () => {
+    expect(error("818180", { maxDepth: 2 })).toBe("nesting deeper than 2")
+    expect(error("8180", { maxDepth: 2 })).toBe("")
+    expect(error("c1c100", { maxDepth: 1 })).toBe("nesting deeper than 1")
+  })
+  it("decodes maps with other keys as Pairs, unless anyKeys is false", () => {
+    expect(diagnostic(decode(hex.decode("a2016161626b6b02")))).toBe("{1: \"a\", \"kk\": 2}")
+    expect(diagnostic(decode(hex.decode("a120f5")))).toBe("{-1: true}")
+    expect(error("a120f5", { anyKeys: false })).toBe("map keys must be text or unsigned integers")
+    expect(error("a2016161626b6b02", { anyKeys: false })).toBe("a map mixes text and integer keys")
+  })
+  it("rejects duplicate keys, also when encoded differently", () => {
+    expect(error("a2616101616102")).toBe("duplicate map key")
+    expect(error("a201010102")).toBe("duplicate map key")
+    expect(error("a2616101780161" + "02")).toBe("duplicate map key")
+    expect(error("a220012002")).toBe("duplicate map key")
+  })
+  it("rejects malformed items", () => {
+    expect(error("")).toBe("truncated")
+    expect(error("1c")).toBe("reserved additional information 28")
+    expect(error("0102")).toBe("trailing bytes after the item")
+    expect(error("62c328")).toBe("text is not valid UTF-8")
+    expect(error("ff")).toBe("unexpected break")
+    expect(error("5f6161ff")).toBe("an indefinite-length string holds a chunk of another kind")
+    expect(error("5f5f4101ffff")).toBe("an indefinite-length string holds a chunk of another kind")
+    expect(error("f818")).toBe("simple(24) must be encoded in one byte")
+    expect(error("9a7fffffff")).toBe("a length beyond the end of the message")
+  })
+})
+
+describe("encoding", () => {
+  it("writes the shortest float that keeps the value, or doubles", () => {
+    expect(hex.encode(encode(Cbor.Float(1.5)))).toBe("f93e00")
+    expect(hex.encode(encode(Cbor.Float(100000.0)))).toBe("fa47c35000")
+    expect(hex.encode(encode(Cbor.Float(1.1)))).toBe("fb3ff199999999999a")
+    expect(hex.encode(encode(Cbor.Float(0.0 / 0.0)))).toBe("f97e00")
+    expect(hex.encode(encode(Cbor.Float(1.5), { floats: "double" }))).toBe("fb3ff8000000000000")
+  })
+  it("writes tags, undefined, simple values and Pairs", () => {
+    const pairs = Cbor.Pairs([{ key: integer(-1), value: Cbor.Undefined }, { key: Cbor.Text("a"), value: Cbor.Simple(255) }])
+    expect(hex.encode(encode(Cbor.List([tagged(32, Cbor.Text("x")), pairs, Cbor.Simple(16)])))).toBe("83d8206178a220f76161f8fff0")
+  })
+  it("refuses simple values that have no encoding", () => {
+    let refused = 0
+    for (const v of [24, 31, 256, -1]) {
+      try {
+        encode(Cbor.Simple(v));
+      } catch (e: CborError) {
+        refused += 1
+      }
+    }
+    expect(refused).toBe(4)
+  })
+  it("copies decoded byte strings", () => {
+    const input = hex.decode("43010203")
+    const out = decode(input)
+    input.set(1, 9)
+    expect(diagnostic(out)).toBe("h'010203'")
+  })
+})

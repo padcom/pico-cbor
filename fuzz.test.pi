@@ -1,0 +1,82 @@
+// Untrusted bytes through the decoder, with the default options and the Pico Desktop profile:
+// random bytes and mutations of valid items. decode may only throw CborError (a panic, such as
+// an out-of-bounds read, would end the run), and what it accepts must round-trip. Deterministic.
+import { describe, it, expect } from "std/test"
+import { Random } from "std/math"
+import { hex } from "std/encoding"
+import { CborError, CborOptions, PICO_DESKTOP, decode, encode } from "./index"
+
+const EDGES: int[] = [0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1f, 0x5f, 0x7f, 0x9f, 0xbf, 0xc0, 0xd8, 0xf7, 0xf8, 0xf9, 0xff, 0x00]
+
+const SEEDS: string[] = [
+  "a26161016162820203", "9f018202039f0405ffff", "bf6346756ef563416d7421ff", "c11a514b67b0",
+  "7f657374726561646d696e67ff", "a3f5f6006161fb3ff8000000000000a1f7f0", "8401f93e00fa47c350005f420102ff",
+]
+
+function mutate(valid: Uint8Array, random: Random): Uint8Array {
+  const bytes: int[] = []
+  for (let k = 0; k < valid.length; k++) {
+    bytes.push(valid.get(k))
+  }
+  const n = random.int(1, 5)
+  for (let i = 0; i < n; i++) {
+    const at = if (bytes.length == 0) 0 else random.int(0, bytes.length)
+    const op = random.int(0, 5)
+    if (op == 1) {
+      const _inserted = bytes.splice(at, 0, random.int(0, 256))
+    } else if (op == 3) {
+      const _truncated = bytes.splice(at, bytes.length - at)
+    } else if (at < bytes.length) {
+      if (op == 0) {
+        bytes[at] = random.int(0, 256)
+      } else if (op == 2) {
+        const _deleted = bytes.splice(at, 1)
+      } else {
+        bytes[at] = EDGES[random.int(0, EDGES.length)]
+      }
+    }
+  }
+  return Uint8Array.from(bytes)
+}
+
+function randomBytes(random: Random): Uint8Array {
+  const out = new Uint8Array(random.int(0, 48))
+  for (let i = 0; i < out.length; i++) {
+    out.set(i, random.int(0, 256))
+  }
+  return out
+}
+
+/// Whether `bytes` decode (and if so, that they round-trip).
+function checks(bytes: Uint8Array, options: CborOptions): bool {
+  try {
+    const value = decode(bytes, options)
+    const once = hex.encode(encode(value, options))
+    expect(hex.encode(encode(decode(hex.decode(once), options), options))).toBe(once)
+    true
+  } catch (e: CborError) {
+    false
+  }
+}
+
+function survives(options: CborOptions, seed: int): int {
+  const random = new Random(seed)
+  const valid = SEEDS.map((s) => hex.decode(s))
+  let accepted = 0
+  for (let i = 0; i < 20000; i++) {
+    const bytes = if (i % 4 == 0) randomBytes(random) else mutate(valid[random.int(0, valid.length)], random)
+    if (checks(bytes, options)) {
+      accepted += 1
+    }
+  }
+  return accepted
+}
+
+describe("decoding untrusted bytes", () => {
+  it("with the defaults: only CborError, and what it accepts round-trips", () => {
+    expect(survives({}, 24301) > 500).toBe(true)
+  })
+  it("with the Pico Desktop profile", () => {
+    expect(survives(PICO_DESKTOP, 8949) > 50).toBe(true)
+  })
+})
