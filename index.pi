@@ -5,4 +5,4 @@ export { Cbor, CborEntry, CborError, CborOptions, DEFAULT_MAX_DEPTH, PICO_DESKTO
 export { encode } from "./encode"
 export { decode } from "./decode"
 export { DiagnosticOptions, diagnostic } from "./diagnostic"
-export { InvalidPayload, boolean, bytes, choice, float, int, items, members, required, tagOf, text, uint } from "./read"
+export { InvalidPayload, boolean, bytes, choice, float, int, isNull, items, members, required, tagOf, text, uint } from "./read"
