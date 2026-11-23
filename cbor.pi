@@ -1,0 +1,105 @@
+// The CBOR data model (RFC 8949) as one enum, the options both directions take, and the error.
+
+/// A CBOR data item.
+export enum Cbor {
+  /// An unsigned integer, 0 … 2^64 − 1.
+  Uint(value: u64),
+  /// The negative integer −1 − `value` (down to −2^64).
+  Negative(value: u64),
+  /// A byte string.
+  Bytes(value: Uint8Array),
+  /// A text string.
+  Text(value: string),
+  /// An array.
+  List(items: Cbor[]),
+  /// A map whose keys are all text, in order.
+  Dict(entries: Map<string, Cbor>),
+  /// A map whose keys are all unsigned integers, in order.
+  Keyed(entries: Map<u64, Cbor>),
+  /// Any other map (keys of other types, or mixed), in order.
+  Pairs(entries: CborEntry[]),
+  /// A tagged item: `tag(value)`, like 1(1363896240) for a date (build one with `tagged`).
+  Tag(item: Tagged),
+  Bool(value: bool),
+  Null,
+  Undefined,
+  /// A simple value other than false, true, null and undefined (0 … 19, 32 … 255).
+  Simple(value: int),
+  Float(value: f64),
+}
+
+/// A tag and the item it applies to.
+export class Tagged {
+  public readonly tag: u64
+  public readonly value: Cbor
+
+  constructor(tag: u64, value: Cbor) {
+    this.tag = tag
+    this.value = value
+  }
+}
+
+/// `tag(value)` as a `Cbor` item.
+export function tagged(tag: u64, value: Cbor): Cbor {
+  Cbor.Tag(new Tagged(tag, value))
+}
+
+/// One entry of a `Pairs` map.
+export struct CborEntry {
+  key: Cbor
+  value: Cbor
+}
+
+/// What encoding and decoding accept. Every field is optional; the defaults take all of CBOR.
+export struct CborOptions {
+  /// The deepest nesting of arrays, maps and tags (default 64).
+  maxDepth?: int
+  /// Whether tags are allowed (default true).
+  tags?: bool
+  /// Whether indefinite-length items are decoded (default true). Encoding always writes definite
+  /// lengths.
+  indefinite?: bool
+  /// Whether `undefined` and simple values other than false, true and null are allowed (default
+  /// true).
+  simple?: bool
+  /// Whether map keys may be anything (default true: maps whose keys aren't all text or all
+  /// unsigned integers are `Pairs`); with false, only text or unsigned integers, not mixed.
+  anyKeys?: bool
+  /// How floats are encoded: `"shortest"` (default: half, single or double precision, the first
+  /// that keeps the value, as RFC 8949's preferred serialization) or `"double"` (always 8 bytes).
+  floats?: string
+}
+
+/// The defaults: all of CBOR, nesting up to 64.
+export const DEFAULT_MAX_DEPTH: int = 64
+
+/// Pico Desktop's profile (its protocol §3): no tags, definite lengths, only false/true/null,
+/// text- or uint-keyed maps, nesting up to 32, doubles for every float.
+export const PICO_DESKTOP: CborOptions = {
+  maxDepth: 32,
+  tags: false,
+  indefinite: false,
+  simple: false,
+  anyKeys: false,
+  floats: "double",
+}
+
+/// Bytes that aren't CBOR, or not CBOR the options accept; or a value that can't be encoded.
+export class CborError extends Error {
+  constructor(message: string) {
+    super(message)
+  }
+}
+
+/// `n` as a CBOR integer.
+export function integer(n: int): Cbor {
+  if (n >= 0) Cbor.Uint(n as u64) else Cbor.Negative((-1 - n) as u64)
+}
+
+/// Fails when `depth` is deeper than the options allow.
+export function nested(depth: int, options: CborOptions): void throws CborError {
+  const max = options.maxDepth ?? DEFAULT_MAX_DEPTH
+  if (depth > max) {
+    throw new CborError(`nesting deeper than ${max}`)
+  }
+}

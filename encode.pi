@@ -1,0 +1,155 @@
+// Encoding with RFC 8949's preferred serialization: the shortest argument for every head, definite
+// lengths, and (unless the options say "double") the shortest float that keeps the value.
+import { ByteBuffer } from "std/bytes"
+import { Cbor, CborError, CborOptions, nested } from "./cbor"
+
+class Writer {
+  out: ByteBuffer = new ByteBuffer(256)
+  options: CborOptions
+  scratch: DataView = new DataView(new ArrayBuffer(8))
+
+  constructor(options: CborOptions) {
+    this.options = options
+  }
+
+  head(major: int, n: u64): void {
+    const m = major << 5
+    if (n < 24) {
+      out.writeByte(m | (n as int))
+    } else if (n < 256) {
+      out.writeByte(m | 24)
+      out.writeByte(n as int)
+    } else if (n < 65536) {
+      out.writeByte(m | 25)
+      out.writeUint16(n as int)
+    } else if (n < 4294967296) {
+      out.writeByte(m | 26)
+      out.writeUint32(n as int)
+    } else {
+      out.writeByte(m | 27)
+      out.writeBigUint64(n)
+    }
+  }
+
+  float(f: f64): void {
+    if (options.floats == "double") {
+      out.writeByte(0xfb)
+      out.writeFloat64(f)
+      return
+    }
+    if (f != f) {
+      // The canonical NaN, as RFC 8949 §4.2.2 suggests.
+      out.writeByte(0xf9)
+      out.writeUint16(0x7e00)
+      return
+    }
+    scratch.setFloat16(0, f)
+    if (scratch.getFloat16(0) == f) {
+      out.writeByte(0xf9)
+      out.writeFloat16(f)
+      return
+    }
+    const single = f as f32
+    if ((single as f64) == f) {
+      out.writeByte(0xfa)
+      out.writeFloat32(single)
+      return
+    }
+    out.writeByte(0xfb)
+    out.writeFloat64(f)
+  }
+
+  text(s: string): void {
+    const utf8 = new TextEncoder().encode(s)
+    head(3, utf8.length as u64)
+    out.write(utf8)
+  }
+
+  public item(v: Cbor, depth: int): void throws CborError {
+    match (v) {
+      Uint { value } => head(0, value),
+      Negative { value } => head(1, value),
+      Bytes { value } => {
+        head(2, value.length as u64)
+        out.write(value)
+      },
+      Text { value } => text(value),
+      List { items } => {
+        nested(depth, options)
+        head(4, items.length as u64)
+        for (const element of items) {
+          item(element, depth + 1)
+        }
+      },
+      Dict { entries } => {
+        nested(depth, options)
+        head(5, entries.size as u64)
+        for (const [key, value] of entries) {
+          text(key)
+          item(value, depth + 1)
+        }
+      },
+      Keyed { entries } => {
+        nested(depth, options)
+        head(5, entries.size as u64)
+        for (const [key, value] of entries) {
+          head(0, key)
+          item(value, depth + 1)
+        }
+      },
+      Pairs { entries } => {
+        nested(depth, options)
+        if (options.anyKeys == false) {
+          throw new CborError("map keys must be text or unsigned integers")
+        }
+        head(5, entries.length as u64)
+        for (const e of entries) {
+          item(e.key, depth + 1)
+          item(e.value, depth + 1)
+        }
+      },
+      Tag { item: t } => {
+        if (options.tags == false) {
+          throw new CborError("tags are not allowed")
+        }
+        nested(depth, options)
+        head(6, t.tag)
+        item(t.value, depth + 1)
+      },
+      Bool { value } => out.writeByte(if (value) 0xf5 else 0xf4),
+      Null => out.writeByte(0xf6),
+      Undefined => {
+        if (options.simple == false) {
+          throw new CborError("undefined is not allowed")
+        }
+        out.writeByte(0xf7)
+      },
+      Simple { value } => {
+        if (options.simple == false) {
+          throw new CborError("simple values other than false, true and null are not allowed")
+        }
+        if (value < 0 || value > 255 || (value >= 20 && value < 32)) {
+          throw new CborError(`simple(${value}) can't be encoded`)
+        }
+        if (value < 24) {
+          out.writeByte(0xe0 | value)
+        } else {
+          out.writeByte(0xf8)
+          out.writeByte(value)
+        }
+      },
+      Float { value } => float(value),
+    }
+  }
+
+  public result(): Uint8Array {
+    return out.toUint8Array()
+  }
+}
+
+/// `v` as CBOR (preferred serialization).
+export function encode(v: Cbor, options: CborOptions = {}): Uint8Array throws CborError {
+  const w = new Writer(options)
+  w.item(v, 1)
+  return w.result()
+}
